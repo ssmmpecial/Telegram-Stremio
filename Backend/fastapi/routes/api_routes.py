@@ -31,6 +31,7 @@ from Backend.helper.custom_dl import ByteStreamer, _speed_test_single_client, ru
 from Backend.helper.encrypt import decode_string, encode_string
 from Backend.helper.health import run_health_checks
 from Backend.helper.manual_add import resolve_telegram_message, stamp_caption_by_ref
+from Backend.helper.pyro import resolve_video_thumb_url
 from Backend.helper.requests_manager import (
     delete_request,
     list_requests,
@@ -1280,11 +1281,15 @@ async def manual_add_media_api(payload: dict) -> dict:
         base["imdb_id"] = f"tg{abs(int(base['tmdb_id']))}"
     _fill_placeholder_metadata(base)
 
-    #----- Store the file thumbnail as a base-relative path so it survives base_url changes
     thumb_url = ""
     if primary.get("has_thumb"):
         thumb_enc = await encode_string({"chat_id": int(primary["chat_id"]), "msg_id": int(primary["msg_id"])})
-        thumb_url = f"/thumb/{thumb_enc}"
+        try:
+            chat_ref = int(f"-100{str(primary['chat_id']).replace('-100', '')}")
+            msg = await client.get_messages(chat_ref, int(primary["msg_id"]))
+            thumb_url = await resolve_video_thumb_url(client, msg, thumb_enc)
+        except Exception:
+            thumb_url = f"/thumb/{thumb_enc}"
 
     #----- Split parts share one quality entry via a common group key
     group_key = f"manual:{primary['chat_id']}:{quality}:{secrets.token_hex(6)}" if is_split else None
@@ -1304,6 +1309,8 @@ async def manual_add_media_api(payload: dict) -> dict:
             "episode_overview": payload.get("episode_overview") or "",
             "episode_released": payload.get("episode_released") or "",
         }
+    elif thumb_url and not base.get("backdrop"):
+        base["backdrop"] = thumb_url
 
     for index, part in enumerate(resolved_parts, start=1):
         p_channel = int(part["chat_id"])
@@ -1767,7 +1774,7 @@ async def update_settings_api(payload: dict) -> dict:
         del payload["session_secret"]
 
     #----- Type coercion and validation
-    bool_keys = {"replace_mode", "duplicate_protection", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both", "mediaflow_proxy", "announce_new_content", "delete_on_metadata_fail", "better_poster_enabled", "rpdb_enabled", "fanart_enabled", "fanart_shuffle", "fanart_low_res_poster"}
+    bool_keys = {"replace_mode", "duplicate_protection", "hide_catalog", "subscription", "show_proxy_and_non_proxy_both", "mediaflow_proxy", "announce_new_content", "delete_on_metadata_fail", "better_poster_enabled", "rpdb_enabled", "spatial_poster_enabled", "fanart_enabled", "fanart_shuffle", "fanart_low_res_poster"}
     for key in bool_keys:
         if key in payload:
             payload[key] = bool(payload[key])
@@ -1784,6 +1791,25 @@ async def update_settings_api(payload: dict) -> dict:
         if payload["better_poster"] and "{imdb_id}" not in payload["better_poster"]:
             raise HTTPException(status_code=400, detail="wrong betterposter url")
 
+    if "spatial_poster" in payload:
+        payload["spatial_poster"] = str(payload["spatial_poster"] or "").strip()
+        if payload["spatial_poster"] and "{imdb_id}" not in payload["spatial_poster"]:
+            raise HTTPException(status_code=400, detail="SpatialPosters URL must contain {imdb_id}")
+
+    if payload.get("spatial_poster_enabled") and not payload.get("spatial_poster"):
+        raise HTTPException(status_code=400, detail="SpatialPosters URL is required")
+
+    if "stream_formatter" in payload:
+        from Backend.helper.stream_formatter import PRESETS
+        if payload["stream_formatter"] not in ("default", "custom", *PRESETS):
+            raise HTTPException(status_code=400, detail="Unknown stream formatter")
+    for key in ("formatter_name", "formatter_description"):
+        if key in payload:
+            payload[key] = str(payload[key] or "")[:20000]
+
+    if "default_streaming" in payload and payload["default_streaming"] not in ("bots", "userbot"):
+        raise HTTPException(status_code=400, detail="default_streaming must be 'bots' or 'userbot'")
+
     if "rpdb_api_key" in payload:
         payload["rpdb_api_key"] = str(payload["rpdb_api_key"] or "").strip()
 
@@ -1796,7 +1822,7 @@ async def update_settings_api(payload: dict) -> dict:
         except (ValueError, TypeError):
             payload["fanart_shuffle_interval"] = 5
 
-    if len([k for k in ("better_poster_enabled", "rpdb_enabled", "fanart_enabled") if payload.get(k)]) > 1:
+    if len([k for k in ("better_poster_enabled", "rpdb_enabled", "spatial_poster_enabled", "fanart_enabled") if payload.get(k)]) > 1:
         raise HTTPException(status_code=400, detail="Enable only one poster provider at a time")
 
     if payload.get("fanart_enabled") and not str(payload.get("fanart_api_key") or "").strip():
@@ -1915,6 +1941,7 @@ async def update_settings_api(payload: dict) -> dict:
     #----- Strip whitespace from string fields
     for key in ("tmdb_api", "base_url", "upstream_repo", "upstream_branch",
                 "admin_username", "admin_password", "session_secret", "http_proxy_url",
+                "cf_stream_url", "cf_stream_secret", "cf_stream_mode",
                 "mediaflow_password", "payment_instructions", "payment_qr_url",
                 "announcement_channel", "skip_channel"):
         if key in payload and isinstance(payload[key], str):
